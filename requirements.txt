@@ -1,0 +1,9 @@
+flask
+python-dotenv
+requests
+scikit-learn
+pandas
+joblib
+pytest
+waitress; platform_system == "Windows"
+gunicorn; platform_system != "Windows"
