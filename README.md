@@ -1,4 +1,4 @@
-StudyMate nis a learning platform project.
+StudyMate is a learning platform project.
 
 
 
