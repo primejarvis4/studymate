@@ -6,6 +6,8 @@
 <title>StudyMate</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="manifest" href="/static/manifest.json">
+<meta name="theme-color" content="#2563eb">
 <style>
   :root {
     --bg: #F2F4FB; --sidebar: #FFFFFF; --surface: #FFFFFF; --card: #FFFFFF;
@@ -1089,6 +1091,12 @@
   // ---------- start ----------
   resetChat();
   checkLogin();
+  if ("serviceWorker" in navigator) {
+    navigator.serviceWorker.register("/static/service-worker.js")
+        .then(() => console.log("Service Worker registered"))
+        .catch((error) => console.log("Service Worker failed:", error));
+}
+
 </script>
 </body>
 </html>
