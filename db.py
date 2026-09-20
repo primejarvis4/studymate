@@ -1,17 +1,49 @@
 import os
 import sqlite3
 import json
+import time
 from contextlib import contextmanager
 
+try:
+    import psycopg
+except ImportError:  # only needed when DATABASE_URL is set
+    psycopg = None
+
 DB_FILE = os.getenv("STUDYMATE_DB", "studymate.db")
+
+# Set DATABASE_URL on the host (Render) to use Postgres.
+# Leave it unset on your laptop and the app uses the SQLite file, exactly as before.
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+
+def _use_postgres():
+    return bool(DATABASE_URL)
+
+
+class _PgConnection:
+    """Lets the rest of this file write '?' placeholders for both databases."""
+
+    def __init__(self, conn):
+        self._conn = conn
+
+    def execute(self, sql, params=()):
+        return self._conn.execute(sql.replace("?", "%s"), params)
 
 
 @contextmanager
 def get_db():
     """Opens the database, saves changes on success, undoes them on error, always closes."""
-    conn = sqlite3.connect(DB_FILE)
+    if _use_postgres():
+        if psycopg is None:
+            raise RuntimeError("DATABASE_URL is set but psycopg is not installed.")
+        # prepare_threshold=None keeps this safe behind Neon's pooled connection
+        conn = psycopg.connect(DATABASE_URL, prepare_threshold=None)
+        wrapped = _PgConnection(conn)
+    else:
+        conn = sqlite3.connect(DB_FILE)
+        wrapped = conn
     try:
-        yield conn
+        yield wrapped
         conn.commit()
     except Exception:
         conn.rollback()
@@ -20,42 +52,60 @@ def get_db():
         conn.close()
 
 
-def _add_column_if_missing(conn, table, column, definition):
-    existing = [row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()]
-    if column not in existing:
-        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+def _integrity_errors():
+    errors = [sqlite3.IntegrityError]
+    if psycopg is not None:
+        errors.append(psycopg.IntegrityError)
+    return tuple(errors)
+
+
+def _add_user_id_column(conn, table):
+    """Adds the owner column to tables created before accounts existed."""
+    if _use_postgres():
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS user_id INTEGER")
+    else:
+        existing = [row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+        if "user_id" not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN user_id INTEGER")
 
 
 def init_db():
+    pg = _use_postgres()
+    print(f"StudyMate database: {'Postgres' if pg else DB_FILE}")
+    primary_key = "SERIAL PRIMARY KEY" if pg else "INTEGER PRIMARY KEY AUTOINCREMENT"
+    username_column = "TEXT NOT NULL" if pg else "TEXT NOT NULL UNIQUE COLLATE NOCASE"
+
     with get_db() as conn:
-        conn.execute("""
+        if pg:
+            # stops two starting processes from creating tables at the same moment
+            conn.execute("SELECT pg_advisory_xact_lock(424242)")
+
+        conn.execute(f"""
             CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                username TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                id {primary_key},
+                username {username_column},
                 password_hash TEXT NOT NULL,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        conn.execute("""
+        conn.execute(f"""
             CREATE TABLE IF NOT EXISTS messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id {primary_key},
                 role TEXT,
                 content TEXT
             )
         """)
-        conn.execute("""
+        conn.execute(f"""
             CREATE TABLE IF NOT EXISTS notes (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id {primary_key},
                 content TEXT,
                 embedding TEXT,
                 subject TEXT
             )
         """)
-        
-
-        conn.execute("""
+        conn.execute(f"""
             CREATE TABLE IF NOT EXISTS quiz_results (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id {primary_key},
                 subject TEXT,
                 difficulty TEXT,
                 questions TEXT,
@@ -64,29 +114,22 @@ def init_db():
                 total INTEGER
             )
         """)
-
-        conn.execute("""
+        conn.execute(f"""
             CREATE TABLE IF NOT EXISTS login_failures (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id {primary_key},
                 key TEXT NOT NULL,
-                created_at INTEGER NOT NULL
+                created_at DOUBLE PRECISION NOT NULL
             )
         """)
 
-        # add the owner column to tables created before auth existed
         for table in ("messages", "notes", "quiz_results"):
-            _add_column_if_missing(conn, table, "user_id", "INTEGER")
+            _add_user_id_column(conn, table)
 
+        # usernames are unique ignoring capital letters, on both databases
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username_lower ON users (lower(username))")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_notes_user_subject ON notes(user_id, subject)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_quiz_user ON quiz_results(user_id)")
-
-
-        # add the owner column to tables created before auth existed
-        for table in ("messages", "notes", "quiz_results"):
-            _add_column_if_missing(conn, table, "user_id", "INTEGER")
-
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_notes_user_subject ON notes(user_id, subject)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_quiz_user ON quiz_results(user_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_login_failures_key ON login_failures(key, created_at)")
 
 
 # ---------- users ----------
@@ -95,12 +138,12 @@ def create_user(username, password_hash):
     """Returns the new user's id, or None if that username is already taken."""
     try:
         with get_db() as conn:
-            cursor = conn.execute(
-                "INSERT INTO users (username, password_hash) VALUES (?, ?)",
+            row = conn.execute(
+                "INSERT INTO users (username, password_hash) VALUES (?, ?) RETURNING id",
                 (username, password_hash),
-            )
-            return cursor.lastrowid
-    except sqlite3.IntegrityError:
+            ).fetchone()
+            return row[0]
+    except _integrity_errors():
         return None
 
 
@@ -108,7 +151,7 @@ def get_user_by_username(username):
     """Returns (id, username, password_hash) or None."""
     with get_db() as conn:
         return conn.execute(
-            "SELECT id, username, password_hash FROM users WHERE username = ?",
+            "SELECT id, username, password_hash FROM users WHERE lower(username) = lower(?)",
             (username,),
         ).fetchone()
 
@@ -122,7 +165,7 @@ def get_user_by_id(user_id):
 
 
 def claim_unowned_data(user_id):
-    """Gives all data saved before auth existed to this user. Returns rows claimed per table."""
+    """Gives all data saved before accounts existed to this user. Returns rows claimed per table."""
     claimed = {}
     with get_db() as conn:
         for table in ("messages", "notes", "quiz_results"):
@@ -175,7 +218,7 @@ def get_all_notes(user_id=None):
 
 
 def get_notes_by_subject(subject, user_id=None):
-    sql = "SELECT id, content, embedding, subject FROM notes WHERE subject = ? COLLATE NOCASE"
+    sql = "SELECT id, content, embedding, subject FROM notes WHERE lower(subject) = lower(?)"
     params = [subject]
     if user_id is not None:
         sql += " AND user_id = ?"
@@ -206,36 +249,29 @@ def get_all_quiz_results(user_id=None):
         rows = conn.execute(sql, params).fetchall()
     return [(id, subject, difficulty, json.loads(q), json.loads(a), score, total)
             for id, subject, difficulty, q, a, score, total in rows]
-# ---------- login protection ----------
+
+
+# ---------- login attempt limits ----------
 
 def record_failed_login(key):
     with get_db() as conn:
         conn.execute(
-            "INSERT INTO login_failures (key, created_at) VALUES (?, strftime('%s','now'))",
-            (key,)
+            "INSERT INTO login_failures (key, created_at) VALUES (?, ?)",
+            (key, time.time()),
         )
 
 
 def count_recent_failures(key, window_seconds):
+    now = time.time()
     with get_db() as conn:
-        result = conn.execute(
-            """
-            SELECT COUNT(*) FROM login_failures
-            WHERE key = ?
-            AND created_at > strftime('%s','now') - ?
-            """,
-            (key, window_seconds),
-        ).fetchone()
-
-    return result[0]
+        # tidy up rows older than a day so the table doesn't grow forever
+        conn.execute("DELETE FROM login_failures WHERE created_at < ?", (now - 86400,))
+        return conn.execute(
+            "SELECT COUNT(*) FROM login_failures WHERE key = ? AND created_at >= ?",
+            (key, now - window_seconds),
+        ).fetchone()[0]
 
 
 def clear_failures(key):
     with get_db() as conn:
-        conn.execute(
-            "DELETE FROM login_failures WHERE key = ?",
-            (key,)
-        )
-
-
-
+        conn.execute("DELETE FROM login_failures WHERE key = ?", (key,))
