@@ -13,5 +13,6 @@ def get_embedding(text):
     }
     response = requests.post(url, json=body, timeout=45)
     data = response.json()
+    print(data)
     return data["embedding"]["values"]
 
